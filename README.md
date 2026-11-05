@@ -75,6 +75,7 @@ the requested seconds; EARLY WAKE lines indicate a new wake source.
 | `test/mbp132-auto-test.sh` | — | unattended S3 test: RTC self-wake, wake-source capture, GPE deltas, T1/TBT/wifi verdicts → `logs/latest` |
 | apple-ib-drv (external, `MBP_T1_DRVDIR`) | DKMS apple-ib-drv/0.1 | apple-ibridge + apple-touchbar + macbook_t1_socw |
 | `cs8409-resume-fix/` | /usr/src/snd_hda_macbookpro-0.1 (patch_cirrus/) | CS8409 audio resume fix: re-runs Apple boot setup after S3 (port of Fedora patch 0002; param `resume_reinit`) |
+| `firmware/brcmfmac43602-pcie.txt` | /lib/firmware/brcm/ | Broadcom BCM43602 NVRAM (macaddr zeroed — the driver uses the real MAC anyway) |
 
 ## Known limitations
 
