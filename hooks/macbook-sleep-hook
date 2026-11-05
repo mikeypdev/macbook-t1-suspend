@@ -99,9 +99,13 @@ pre)
     [[ -e $d ]] || continue
     a=${d##*/}
     [[ $(cat "$d/vendor") == 0x14e4 && $(cat "$d/device") == 0x43ba ]] || continue
-    echo "$a" >> "$STATE/wifi"   # record first, so post rebinds even on partial failure
-    if echo "$a" > "$DRV/unbind" 2>/dev/null; then log "pre: unbound Wi-Fi $a"
-    else log "pre: WARNING could not unbind Wi-Fi $a"; fi
+    echo "$a" >> "$STATE/wifi"   # record first, so post rescans even on partial failure
+    # Full PCI remove, not just driver unbind: a BCM43602 left on the bus
+    # through S3 fails re-probe with "MMIO read failed: 0xffffffff"
+    # (observed even with a healthy chip, 2026-11-04). Remove forces a clean
+    # re-enumeration + firmware re-download on the post-sleep rescan.
+    if echo 1 > "/sys/bus/pci/devices/$a/remove" 2>/dev/null; then log "pre: removed Wi-Fi $a (PCI remove, not unbind)"
+    else log "pre: WARNING could not remove Wi-Fi $a"; fi
   done
   # CS8409 must be runtime-IDLE before the suspend sequence starts. If it is
   # still active (audio playing or just played), the kernel powers it down
@@ -171,12 +175,30 @@ post)
   socw 1 post
   "$TB" post suspend
   if [[ -f $STATE/wifi ]]; then
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 3
     while read -r a; do
-      [[ -n $a && ! -e /sys/bus/pci/devices/$a/driver ]] || continue
-      if echo "$a" > "$DRV/bind" 2>/dev/null; then log "post: rebound Wi-Fi $a"
-      else log "post: WARNING could not rebind Wi-Fi $a"; fi
+      [[ -n $a ]] || continue
+      if [[ -e /sys/bus/pci/devices/$a/driver ]]; then
+        log "post: Wi-Fi $a re-enumerated and bound"
+      elif [[ -e /sys/bus/pci/devices/$a ]]; then
+        if echo "$a" > "$DRV/bind" 2>/dev/null; then log "post: rebound Wi-Fi $a"
+        else log "post: WARNING could not rebind Wi-Fi $a"; fi
+      else
+        log "post: WARNING Wi-Fi $a missing after rescan"
+      fi
     done < "$STATE/wifi"
     rm -f "$STATE/wifi"
+    # PSM (firmware power-save module) watchdog hangs on BCM43602 after warm
+    # resumes; never let wifi power_save stay on after a rebind.
+    sleep 2
+    for ifc in $(iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'); do
+      if iw dev "$ifc" set power_save off 2>/dev/null; then
+        log "post: power_save off on $ifc"
+      else
+        log "post: WARNING could not disable power_save on $ifc"
+      fi
+    done
   fi
   if [[ -f $STATE/xhc1-wake ]]; then
     echo "$(cat "$STATE/xhc1-wake")" > "$XHC1/power/wakeup" 2>/dev/null

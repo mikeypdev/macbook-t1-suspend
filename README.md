@@ -66,15 +66,18 @@ the requested seconds; EARLY WAKE lines indicate a new wake source.
 | File | Installs to | Role |
 |---|---|---|
 | `apply-suspend-fix.sh` | — | installer: GRUB `mem_sleep_default=deep` (no pcie_port_pm), sleep.conf, hooks, udev rules, DKMS rebuild |
-| `hooks/macbook-sleep-hook` | /usr/local/sbin | pre: force deep, NVMe guard, wifi unbind, CS8409 codec idle (profile off + autosuspend 0), TBT removal, XHC1/ARPT/SPIT/LID0(if lid open) wake masks, SOCW(0). post: SOCW(1), TBT rescan, wifi rebind, wake restores, codec profile restore, touchbar mode re-send (idle_timeout -2 → saved) |
+| `hooks/macbook-sleep-hook` | /usr/local/sbin | pre: force deep, NVMe guard, wifi PCI remove (rebind alone wedges the chip), CS8409 codec idle (profile off + autosuspend 0), TBT removal, XHC1/ARPT/SPIT/LID0(if lid open) wake masks, SOCW(0). post: SOCW(1), TBT rescan, wifi rescan + bind + power_save off, wake restores, codec profile restore, touchbar mode re-send (idle_timeout -2 → saved) |
 | `hooks/macbook-thunderbolt-remove-rescan` | /usr/local/sbin | TBT upstream-port removal before sleep + rescan/retries after (journal tag: thunderbolt-remove-rescan) |
 | `systemd/90-mbp132-deep.conf` | /etc/systemd/sleep.conf.d | SuspendState=mem, MemorySleepMode=deep |
 | `systemd/50-mbp132-s3.conf` | systemd-suspend.service.d | ExecStartPre/ExecStopPost = the hook |
 | `systemd/61-mbp132-nvme-d3cold.rules` | /etc/udev/rules.d | NVMe d3cold_allowed=0 |
 | `systemd/99-mbp132-usbc-runtime.rules` + `systemd/macbook-usbc-runtime.service` | udev/systemd | keep Alpine Ridge USB3 root hubs runtime-awake (USB-C hotplug detection) |
+| `wifi-recover` | — | manual Wi-Fi recovery ladder: brcmfmac rebind → PCI remove/rescan → ARPT root-port D3cold cycle (`sudo ./wifi-recover`) |
 | `test/mbp132-auto-test.sh` | — | unattended S3 test: RTC self-wake, wake-source capture, GPE deltas, T1/TBT/wifi verdicts → `logs/latest` |
 | apple-ib-drv (external, `MBP_T1_DRVDIR`) | DKMS apple-ib-drv/0.1 | apple-ibridge + apple-touchbar + macbook_t1_socw |
 | `cs8409-resume-fix/` | /usr/src/snd_hda_macbookpro-0.1 (patch_cirrus/) | CS8409 audio resume fix: re-runs Apple boot setup after S3 (port of Fedora patch 0002; param `resume_reinit`) |
+| `systemd/tlp-20-usb.conf` | /etc/tlp.d/20-usb.conf | TLP: USB autosuspend denylist by USB id (1d6b:0003 root hubs) so Alpine Ridge USB-C hotplug stays working (PCI id in stock config matched nothing) |
+| `systemd/tlp-30-wifi.conf` | /etc/tlp.d/30-wifi.conf | TLP: disable 802.11 power save (BCM43602 PSM watchdog firmware hang) |
 | `firmware/brcmfmac43602-pcie.txt` | /lib/firmware/brcm/ | Broadcom BCM43602 NVRAM (macaddr zeroed — the driver uses the real MAC anyway) |
 
 ## Known limitations
