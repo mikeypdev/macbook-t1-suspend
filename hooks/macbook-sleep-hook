@@ -26,7 +26,9 @@
 #       wake (its GPE 0x6F/GPD2 line asserts right after S3 entry -> 3 s
 #       "instant wake"); lid-closed suspends unchanged.
 # post: FIRST: ASOC.SOCW(1) (T1 keeps the Touch Bar dark after S3 without it);
-#       Thunderbolt rescan; rebind Wi-Fi; restore XHC1 wake to what it was;
+#       Thunderbolt rescan; rebind Wi-Fi (+45 s watchdog: power_save off,
+#       rebind + wifi-recover ladder if it never associates); restore XHC1
+#       wake to what it was;
 #       restore codec autosuspend delay + audio card profile (audio comes
 #       back on first playback - the patched cs8409 re-runs boot setup);
 #       re-send Touch Bar mode (driver cache is stale after reset-resume):
@@ -199,6 +201,17 @@ post)
         log "post: WARNING could not disable power_save on $ifc"
       fi
     done
+    # NetworkManager re-applies wifi.powersave to the re-probed device when
+    # it initializes it, right after this hook - TLP cannot counter that
+    # (its resume hook runs before the rescan brings the card back), and
+    # even a clean re-enumeration + fresh firmware sometimes comes up wedged
+    # (2026-11-05 12:45 resume: assoc rejects + EAPOL timeouts -> reboot).
+    # Watchdog 45 s after resume: enforce power_save off, rebind brcmfmac if
+    # unassociated, then the wifi-recover ladder (needs wifi-recover +
+    # macbook-wifi-watchdog installed in /usr/local/sbin).
+    systemd-run --unit=mbp132-wifi-watchdog --collect --on-active=45 --quiet \
+      /usr/local/sbin/macbook-wifi-watchdog \
+      || log "post: WARNING could not schedule Wi-Fi watchdog"
   fi
   if [[ -f $STATE/xhc1-wake ]]; then
     echo "$(cat "$STATE/xhc1-wake")" > "$XHC1/power/wakeup" 2>/dev/null

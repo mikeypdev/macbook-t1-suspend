@@ -28,10 +28,13 @@ cat "$DROPDIR/90-mbp132-deep.conf"
 
 echo "==> 3/7 S3 sleep hook + Thunderbolt remove/rescan + systemd-suspend drop-in"
 install -m 755 "$SRC/hooks/macbook-sleep-hook" /usr/local/sbin/macbook-sleep-hook
+install -m 755 "$SRC/hooks/macbook-wifi-watchdog" /usr/local/sbin/macbook-wifi-watchdog
+install -m 755 "$SRC/wifi-recover.sh" /usr/local/sbin/wifi-recover
 install -m 755 "$SRC/hooks/macbook-thunderbolt-remove-rescan" /usr/local/sbin/macbook-thunderbolt-remove-rescan
 install -m 644 -D "$SRC/systemd/50-mbp132-s3.conf" /etc/systemd/system/systemd-suspend.service.d/50-mbp132-s3.conf
 systemctl daemon-reload
 echo "    installed /usr/local/sbin/macbook-sleep-hook (pre/post via systemd-suspend.service)"
+echo "    installed macbook-wifi-watchdog (scheduled +45 s after every resume) + wifi-recover"
 
 echo "==> 4/7 udev rules (NVMe d3cold, USB-C runtime) + USB-C runtime service"
 install -m 644 "$SRC/systemd/61-mbp132-nvme-d3cold.rules" /etc/udev/rules.d/61-mbp132-nvme-d3cold.rules
@@ -46,6 +49,13 @@ for d in /sys/bus/pci/devices/*; do
     echo 0 > "$d/d3cold_allowed" 2>/dev/null || true
     echo "    NVMe ${d##*/} d3cold_allowed=$(cat "$d/d3cold_allowed")"
 done
+
+echo "==> 4b/7 NetworkManager: 802.11 power save OFF (BCM43602 PSM firmware hang)"
+install -m 644 -D "$SRC/systemd/networkmanager-wifi-powersave.conf" /etc/NetworkManager/conf.d/macbook-wifi-powersave.conf
+cat /etc/NetworkManager/conf.d/macbook-wifi-powersave.conf
+nmcli general reload 2>/dev/null || echo "    (re-run 'nmcli general reload' once NetworkManager is up)"
+echo "    replaces any older conf with wifi.powersave=2 (enable) - that one re-enabled"
+echo "    power save at every resume re-probe, after TLP and the hook had turned it off"
 
 echo "==> 5/7 Removing superseded s2idle-era hooks"
 rm -f /usr/lib/systemd/system-sleep/mbp132-tbt-recover \

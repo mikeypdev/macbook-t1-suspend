@@ -43,6 +43,9 @@ iface_up() {
   ifc=$(ls /sys/bus/pci/devices/$dev/net 2>/dev/null | head -1)
   [[ -n $ifc ]] || return 1
   ip link show "$ifc" >/dev/null 2>&1 || return 1
+  # an unassociated STA sits at operstate "down" - count association too,
+  # so a healthy-but-still-connecting chip is not escalated needlessly
+  iw dev "$ifc" link 2>/dev/null | grep -q '^Connected' && return 0
   [[ $(cat /sys/class/net/$ifc/operstate) != down ]]
 }
 
@@ -62,7 +65,7 @@ if [[ -n $DEV ]] && [[ -e /sys/bus/pci/devices/$DEV/driver ]]; then
   echo "$DEV" > /sys/bus/pci/drivers/brcmfmac/unbind 2>/dev/null
   sleep 1
   echo "$DEV" > /sys/bus/pci/drivers/brcmfmac/bind 2>/dev/null
-  sleep 3
+  sleep 10   # NetworkManager needs 5-15 s to re-associate after a rebind
   if iface_up "$DEV"; then
     log "OK: interface is up after rebind"
     exit 0

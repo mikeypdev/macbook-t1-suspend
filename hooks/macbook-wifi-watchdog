@@ -1,0 +1,88 @@
+#!/bin/bash
+# macbook-wifi-watchdog - post-resume Wi-Fi watchdog for the MacBookPro13,2
+# BCM43602. Scheduled by macbook-sleep-hook 45 s after every resume
+# (systemd-run --unit=mbp132-wifi-watchdog); also safe to run manually:
+#   sudo /usr/local/sbin/macbook-wifi-watchdog
+#
+# Why: even after the hook's clean PCI remove + re-enumeration + fresh
+# firmware download, the chip sometimes comes up wedged (2026-11-05 12:45
+# resume: assoc rejects status 16 + EAPOL timeouts for 85 s; only a reboot
+# recovered it). NetworkManager also re-applies wifi.powersave to the
+# re-probed device AFTER the hook turned power save off (TLP cannot
+# counter: its resume hook runs before the rescan) - PSM active is the
+# documented firmware-hang trigger.
+#
+# Ladder: power_save off everywhere; if associated -> done. If not:
+# one brcmfmac driver rebind (clears wedged firmware), wait up to 30 s for
+# NetworkManager to reconnect; then /usr/local/sbin/wifi-recover -y
+# (PCI remove/rescan, ARPT root-port D3cold cycle). Never runs the ladder
+# when Wi-Fi is soft-blocked (user switched it off).
+set -u
+TAG=macbook-sleep
+RECOVER=/usr/local/sbin/wifi-recover
+
+ifaces() { iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'; }
+assoc()  { iw dev "$1" link 2>/dev/null | grep -q '^Connected'; }
+log()    { logger -t "$TAG" "watchdog: $*"; }
+
+wifi_soft_blocked() {
+  local r
+  for r in /sys/class/rfkill/*; do
+    [[ -e $r/type && $(cat "$r/type" 2>/dev/null) == wlan && $(cat "$r/soft" 2>/dev/null) == 1 ]] && return 0
+  done
+  return 1
+}
+
+force_ps_off() {
+  local i
+  for i in $(ifaces); do
+    iw dev "$i" set power_save off 2>/dev/null
+  done
+}
+
+if wifi_soft_blocked; then
+  log "Wi-Fi soft-blocked (switched off) - leaving it alone"
+  exit 0
+fi
+
+force_ps_off
+
+for i in $(ifaces); do
+  assoc "$i" && { log "connected on $i (power_save off enforced)"; exit 0; }
+done
+
+if [[ -z $(ifaces) ]]; then
+  log "no wifi interface 45 s after resume - wifi-recover ladder"
+  [[ -x $RECOVER ]] && exec "$RECOVER" -y
+  log "$RECOVER missing - manual recovery needed"
+  exit 1
+fi
+
+log "not associated 45 s after resume - rebinding brcmfmac"
+dev=""
+for i in $(ifaces); do
+  dev=$(basename "$(readlink -f "/sys/class/net/$i/device" 2>/dev/null)" 2>/dev/null)
+  [[ -n $dev ]] && break
+done
+if [[ -n $dev && -e /sys/bus/pci/drivers/brcmfmac/$dev ]]; then
+  echo "$dev" > /sys/bus/pci/drivers/brcmfmac/unbind 2>/dev/null
+  sleep 1
+  echo "$dev" > /sys/bus/pci/drivers/brcmfmac/bind 2>/dev/null
+  for n in $(seq 1 30); do
+    sleep 1
+    force_ps_off   # NM re-applies wifi.powersave when the re-probed device initializes
+    for i in $(ifaces); do
+      assoc "$i" && { log "connected on $i ${n} s after rebind"; exit 0; }
+    done
+  done
+  log "still not associated 30 s after rebind - wifi-recover ladder"
+else
+  log "brcmfmac device not found - wifi-recover ladder"
+fi
+
+if [[ -x $RECOVER ]]; then
+  "$RECOVER" -y
+else
+  log "$RECOVER missing - manual recovery needed"
+fi
+exit 0

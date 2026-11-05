@@ -42,7 +42,7 @@ trap 'kill $INHIBIT_PID 2>/dev/null' EXIT
 xhci() { ls /sys/bus/pci/drivers/xhci_hcd 2>/dev/null | grep -c '^0000'; }
 tbinst() { ls -d /sys/bus/hid/devices/0003:1D6B:0301.* 2>/dev/null | tail -1; }
 gpes() { for g in /sys/firmware/acpi/interrupts/gpe*; do v=$(cat "$g" 2>/dev/null); [[ ${v%% *} == 0 ]] || echo "  ${g##*/}: $v"; done; }
-ts() { journalctl -k -o short-precise --since "$1" --no-pager | grep "$2" | tail -1 | awk '{print $1" "$2}'; }
+ts() { journalctl -k -o short-precise --since "$1" --no-pager | grep "$2" | tail -1 | awk '{print $1" "$2" "$3}'; }
 devwake() { awk -v d="$1" '$1==d {print ($3 ~ /enabled/) ? "enabled" : "disabled"}' /proc/acpi/wakeup; }
 wifi_wait() { for i in $(seq 1 8); do [[ $(cat /sys/class/net/wlp2s0/operstate 2>/dev/null) == up ]] && return 0; sleep 5; done; return 1; }
 RESTORE_WAKE=(); RESTORE_GPE=(); NOHDA=0
