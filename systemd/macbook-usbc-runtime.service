@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply MacBook USB-C (Alpine Ridge) root-hub runtime wake workaround
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/grep -qx MacBookPro13,2 /sys/class/dmi/id/product_name
+# Root hubs enumerated in initramfs never saw the rule: replay USB3 root hubs;
+# the rule itself only acts on those below 8086:15d4.
+ExecStart=/usr/bin/udevadm trigger --action=change --settle --subsystem-match=usb --attr-match=devpath=0 --attr-match=idVendor=1d6b --attr-match=idProduct=0003
+TimeoutStartSec=30
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,241 @@
+#!/bin/bash
+# MacBookPro13,2 S3 (deep) helper, ported from rcarmo/fedora-silverblue-macbook
+# (rebuild-kit/files/usr/local/sbin/macbook-sleep-hook, proven on the same
+# hardware/kernel generation). Run by the systemd-suspend.service drop-in:
+#   ExecStartPre=... pre   /   ExecStopPost=... post
+# pre : force mem_sleep=deep; NVMe (Apple S3X 106b:2003) d3cold_allowed=0
+#       (ABORTS the suspend if that fails - known no-wake otherwise);
+#       unbind BCM43602 Wi-Fi from brcmfmac (firmware hangs across S3;
+#       post-rebind re-probes the existing firmware/NVRAM, which is untouched);
+#       Thunderbolt upstream-port removal (keeps pcieport windows intact);
+#       disable S3 wake from XHC1 (00:14.0, hosts the T1/iBridge on usb 1-3;
+#       suspected instant-wake source) - keyboard SPIT and LID0 stay enabled;
+#       disable ARPT (Wi-Fi PCIe PME) S3 wake - unbinding brcmfmac does NOT
+#       mask it, and it woke this machine ~4 s into every S3 (known issue on
+#       MacBookPro13,2; the pre-S3-fix hooks disabled it too);
+#       disable SPIT (keyboard SPI) S3 wake too - ghost events from it woke
+#       this machine ~4 s into S3 in every unmasked run (masked runs hold;
+#       wake with power button or lid instead);
+#       idle the CS8409 codec BEFORE the suspend sequence (profile off via
+#       PipeWire if audio was playing + autosuspend_delay 0): if the codec is
+#       still active, the kernel powers it down inside the suspend sequence
+#       and that transition instant-wakes S3 on this unit; when already idle,
+#       all codec suspend/resume PM callbacks are skipped and S3 holds;
+#       LAST: tell the T1 the host sleeps: ASOC.SOCW(0) via macbook_t1_socw
+#       (DKMS module in apple-ib-drv); lid OPEN at suspend: disable LID0 S3
+#       wake (its GPE 0x6F/GPD2 line asserts right after S3 entry -> 3 s
+#       "instant wake"); lid-closed suspends unchanged.
+# post: FIRST: ASOC.SOCW(1) (T1 keeps the Touch Bar dark after S3 without it);
+#       Thunderbolt rescan; rebind Wi-Fi; restore XHC1 wake to what it was;
+#       restore codec autosuspend delay + audio card profile (audio comes
+#       back on first playback - the patched cs8409 re-runs boot setup);
+#       re-send Touch Bar mode (driver cache is stale after reset-resume):
+#       idle_timeout -2 then back to its saved value.
+# SOCW is skipped (logged) if the module is missing/unloadable; never blocks sleep.
+# Journal tag: macbook-sleep. Every path except the NVMe guard exits 0.
+set -u
+TAG=macbook-sleep
+TB=/usr/local/sbin/macbook-thunderbolt-remove-rescan
+STATE=/run/macbook-sleep
+DRV=/sys/bus/pci/drivers/brcmfmac
+XHC1=/sys/bus/pci/devices/0000:00:14.0
+SOCW_P=/sys/module/macbook_t1_socw/parameters
+CODEC=/sys/bus/hdaudio/devices/hdaudioC0D0
+CODEC_CARD=alsa_card.pci-0000_00_1f.3
+DESKTOP_USER=${MBP_DESKTOP_USER:-$(loginctl --no-legend 2>/dev/null | awk '$4=="seat0" && $5>0 {print $3; exit}')}
+DESKTOP_UID=$(id -u "$DESKTOP_USER" 2>/dev/null || true)
+pc() { [[ -n $DESKTOP_USER ]] && runuser -u "$DESKTOP_USER" -- env XDG_RUNTIME_DIR=/run/user/$DESKTOP_UID pactl "$@" 2>/dev/null; }
+log() { logger -t "$TAG" -- "$*"; }
+gpe_list() {
+  local g s gl=""
+  for g in /sys/firmware/acpi/interrupts/gpe*; do
+    s=$(cat "$g" 2>/dev/null)
+    [[ $s == *EN*enabled* ]] && gl="$gl${g##*/}=$(echo $s | awk '{print $1}') "
+  done
+  echo "${gl:-none}"
+}
+socw() {  # $1 = 0|1
+  if [[ ! -d $SOCW_P ]]; then
+    if modprobe macbook_t1_socw 2>/dev/null; then log "$2: loaded macbook_t1_socw (modprobe)"
+    else
+      ko=$(modinfo -k "$(uname -r)" -n macbook_t1_socw 2>/dev/null)
+      if [[ -n $ko && -f $ko ]] && insmod "$ko" 2>/dev/null; then log "$2: loaded macbook_t1_socw ($ko)"
+      else log "$2: WARNING macbook_t1_socw not loadable - SOCW($1) skipped"; return 0; fi
+    fi
+  fi
+  if echo "$1" > "$SOCW_P/socw" 2>/dev/null; then log "$2: SOCW($1) ok (ok=$(cat $SOCW_P/calls_ok) failed=$(cat $SOCW_P/calls_failed))"
+  else log "$2: WARNING SOCW($1) failed"; fi
+}
+touchbar_refresh() {
+  local f v n=0
+  for f in /sys/bus/hid/drivers/apple-touchbar/*/idle_timeout; do
+    [[ -w $f ]] || continue
+    v=$(cat "$f"); [[ $v =~ ^-?[0-9]+$ ]] || continue
+    [[ $v == -2 ]] && continue   # user chose "always on"; leave it
+    echo -2 > "$f" 2>/dev/null; sleep 1; echo "$v" > "$f" 2>/dev/null
+    log "post: Touch Bar mode re-sent via ${f%/idle_timeout} (idle_timeout -2 -> $v)"; n=$((n + 1))
+  done
+  (( n )) || log "post: WARNING no apple-touchbar idle_timeout found"
+}
+[[ $(cat /sys/class/dmi/id/product_name 2>/dev/null) == MacBookPro13,2 ]] || exit 0
+
+case "${1:-}" in
+pre)
+  mkdir -p "$STATE"; rm -f "$STATE/wifi"; date +%s > "$STATE/entry-ts"
+  grep -qw deep /sys/power/mem_sleep && echo deep > /sys/power/mem_sleep
+  log "pre: mem_sleep: $(cat /sys/power/mem_sleep)"
+  ok=0
+  for d in /sys/bus/pci/devices/*; do
+    [[ $(cat "$d/vendor") == 0x106b && $(cat "$d/device") == 0x2003 ]] || continue
+    echo 0 > "$d/d3cold_allowed" 2>/dev/null
+    [[ $(cat "$d/d3cold_allowed") == 0 ]] && ok=1
+    log "pre: NVMe ${d##*/} d3cold_allowed=$(cat "$d/d3cold_allowed")"
+  done
+  if (( ! ok )); then
+    log "pre: ERROR Apple NVMe d3cold_allowed not 0 - refusing to suspend (would not wake)"
+    exit 1
+  fi
+  for d in "$DRV"/0000:*; do
+    [[ -e $d ]] || continue
+    a=${d##*/}
+    [[ $(cat "$d/vendor") == 0x14e4 && $(cat "$d/device") == 0x43ba ]] || continue
+    echo "$a" >> "$STATE/wifi"   # record first, so post rebinds even on partial failure
+    if echo "$a" > "$DRV/unbind" 2>/dev/null; then log "pre: unbound Wi-Fi $a"
+    else log "pre: WARNING could not unbind Wi-Fi $a"; fi
+  done
+  # CS8409 must be runtime-IDLE before the suspend sequence starts. If it is
+  # still active (audio playing or just played), the kernel powers it down
+  # INSIDE the suspend sequence (hda_codec_pm_prepare -> force_suspend ->
+  # hda_call_codec_suspend) and on this unit that power transition asserts a
+  # wake line right at S3 arming -> ~4 s instant wake (observed 20:01/20:02
+  # with the patched driver; latent with the stock one too). If the codec is
+  # already runtime-suspended, prepare() reports "suspended" and ALL codec
+  # suspend/resume callbacks are skipped -> S3 holds. Audio after resume is
+  # unaffected: the patched cs8409 driver re-runs boot setup on the first
+  # codec resume after system sleep (system resume or first playback).
+  rm -f "$STATE/codec-delay" "$STATE/codec-profile"
+  if [[ -e $CODEC/power/runtime_status ]]; then
+    if [[ $(cat "$CODEC/power/runtime_status") == suspended ]]; then
+      log "pre: audio codec already idle (PM skip path)"
+    else
+      prof=$(pc list cards | awk -v c="$CODEC_CARD" '$1=="Name:" {n=$2} $1=="Active" && $2=="Profile:" && n==c {print $3; exit}')
+      if [[ -n $prof && $prof != off ]] && pc set-card-profile "$CODEC_CARD" off; then
+        echo "$prof" > "$STATE/codec-profile"
+        log "pre: audio card profile -> off (was: $prof) to idle the codec"
+      fi
+      cat "$CODEC/power/autosuspend_delay_ms" > "$STATE/codec-delay" 2>/dev/null
+      echo 0 > "$CODEC/power/autosuspend_delay_ms" 2>/dev/null
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [[ $(cat "$CODEC/power/runtime_status") == suspended ]] && break
+        sleep 0.2
+      done
+      if [[ $(cat "$CODEC/power/runtime_status") == suspended ]]; then
+        sleep 0.3   # power-down SCI/GPE serviced+cleared before S3 arming
+        log "pre: audio codec idled early (was active; restore on resume)"
+      else
+        log "pre: WARNING audio codec still active after 2 s - instant wake possible"
+      fi
+    fi
+  fi
+  "$TB" pre suspend
+  rm -f "$STATE/xhc1-wake"
+  if [[ $(cat "$XHC1/vendor" 2>/dev/null)/$(cat "$XHC1/class" 2>/dev/null) == 0x8086/0x0c0330 && -w $XHC1/power/wakeup ]]; then
+    cat "$XHC1/power/wakeup" > "$STATE/xhc1-wake"
+    echo disabled > "$XHC1/power/wakeup" 2>/dev/null
+  fi
+  log "pre: XHC1 wake was $(cat "$STATE/xhc1-wake" 2>/dev/null || echo n/a), now $(cat "$XHC1/power/wakeup" 2>/dev/null)"
+  rm -f "$STATE/arpt-wake"
+  if grep -q '^ARPT.*\*enabled' /proc/acpi/wakeup; then
+    echo ARPT > /proc/acpi/wakeup   # toggles enabled -> disabled
+    grep -q '^ARPT.*\*disabled' /proc/acpi/wakeup && { echo enabled > "$STATE/arpt-wake"; log "pre: ARPT (Wi-Fi PME) wake now disabled"; }
+  fi
+  rm -f "$STATE/spit-wake"
+  if grep -q '^SPIT.*\*enabled' /proc/acpi/wakeup; then
+    echo SPIT > /proc/acpi/wakeup   # ghost SPI events otherwise wake S3 in ~4 s
+    grep -q '^SPIT.*\*disabled' /proc/acpi/wakeup && { echo enabled > "$STATE/spit-wake"; log "pre: SPIT (keyboard) wake now disabled (ghost events)"; }
+  fi
+  rm -f "$STATE/lid0-wake"
+  if grep -q open /proc/acpi/button/lid/LID0/state 2>/dev/null && grep -q '^LID0.*\*enabled' /proc/acpi/wakeup; then
+    echo LID0 > /proc/acpi/wakeup   # toggles enabled -> disabled
+    grep -q '^LID0.*\*disabled' /proc/acpi/wakeup && echo enabled > "$STATE/lid0-wake"
+    log "pre: lid open - LID0 wake now $(awk '$1=="LID0"{print $3}' /proc/acpi/wakeup) (wake with keyboard/power button)"
+  fi
+  log "pre: acpi wake enabled: $(awk '$3 ~ /enabled/ {printf "%s(%s) ", $1, $2}' /proc/acpi/wakeup)"
+  grep -q '\[deep\]' /sys/power/mem_sleep && socw 0 pre
+  log "pre: GPEs wake-enabled at entry: $(gpe_list)"
+  log "pre: done"
+  ;;
+post)
+  log "post: active_wakeup_source=$(head -1 /sys/kernel/debug/wakeup_sources 2>/dev/null || echo n/a)"
+  log "post: pm_wakeup_irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null); GPEs wake-enabled: $(gpe_list)"
+  socw 1 post
+  "$TB" post suspend
+  if [[ -f $STATE/wifi ]]; then
+    while read -r a; do
+      [[ -n $a && ! -e /sys/bus/pci/devices/$a/driver ]] || continue
+      if echo "$a" > "$DRV/bind" 2>/dev/null; then log "post: rebound Wi-Fi $a"
+      else log "post: WARNING could not rebind Wi-Fi $a"; fi
+    done < "$STATE/wifi"
+    rm -f "$STATE/wifi"
+  fi
+  if [[ -f $STATE/xhc1-wake ]]; then
+    echo "$(cat "$STATE/xhc1-wake")" > "$XHC1/power/wakeup" 2>/dev/null
+    rm -f "$STATE/xhc1-wake"
+  fi
+  if [[ -f $STATE/arpt-wake ]]; then
+    grep -q '^ARPT.*\*disabled' /proc/acpi/wakeup && echo ARPT > /proc/acpi/wakeup
+    rm -f "$STATE/arpt-wake"
+    log "post: ARPT wake restored: $(awk '$1=="ARPT"{print $3}' /proc/acpi/wakeup)"
+  fi
+  if [[ -f $STATE/spit-wake ]]; then
+    grep -q '^SPIT.*\*disabled' /proc/acpi/wakeup && echo SPIT > /proc/acpi/wakeup
+    rm -f "$STATE/spit-wake"
+    log "post: SPIT wake restored: $(awk '$1=="SPIT"{print $3}' /proc/acpi/wakeup)"
+  fi
+  if [[ -f $STATE/lid0-wake ]]; then
+    grep -q '^LID0.*\*disabled' /proc/acpi/wakeup && echo LID0 > /proc/acpi/wakeup
+    rm -f "$STATE/lid0-wake"
+    log "post: LID0 wake restored: $(awk '$1=="LID0"{print $3}' /proc/acpi/wakeup)"
+  fi
+  log "post: XHC1 wake $(cat "$XHC1/power/wakeup" 2>/dev/null); pm_wakeup_irq=$(cat /sys/power/pm_wakeup_irq 2>/dev/null)"
+  if [[ -f $STATE/codec-delay ]]; then
+    [[ -e $CODEC/power/autosuspend_delay_ms ]] && echo "$(cat "$STATE/codec-delay")" > "$CODEC/power/autosuspend_delay_ms" 2>/dev/null
+    rm -f "$STATE/codec-delay"
+    log "post: codec autosuspend_delay_ms restored to $(cat "$CODEC/power/autosuspend_delay_ms" 2>/dev/null)"
+  fi
+  if [[ -f $STATE/codec-profile ]]; then
+    prof=$(cat "$STATE/codec-profile")
+    pc set-card-profile "$CODEC_CARD" "$prof" && log "post: audio card profile restored: $prof" \
+      || log "post: WARNING could not restore audio profile '$prof' (set it in sound settings)"
+    rm -f "$STATE/codec-profile"
+  fi
+  touchbar_refresh
+  # Self-heal for the intermittent S3 instant-wake chain (platform quirk,
+  # same on the reference machine - see docs/SLEEP.md "14:05-14:10" and its
+  # known-issues): a rare unattributed trigger wakes S3 ~3-4 s in, the short
+  # sleep leaves the TBT tree dead, and further sleeps keep waking until one
+  # holds >=60 s (then the TB tree returns and the chain clears). The
+  # reference machine self-heals because logind re-suspends while the lid
+  # stays closed; replicate that here: woke <20 s after entry AND lid closed
+  # -> re-suspend in 10 s, bounded to 5 attempts per chain (counter resets
+  # after any sleep >=60 s). Lid open = leave it awake for the user.
+  held=$(( $(date +%s) - $(cat "$STATE/entry-ts" 2>/dev/null || date +%s) ))
+  if (( held >= 60 )); then
+    echo 0 > "$STATE/resuspend-n" 2>/dev/null
+  elif grep -q closed /proc/acpi/button/lid/LID0/state 2>/dev/null; then
+    n=$(( $(cat "$STATE/resuspend-n" 2>/dev/null || echo 0) + 1 ))
+    if (( n <= 5 )); then
+      echo "$n" > "$STATE/resuspend-n"
+      log "post: early wake after ${held}s with lid closed - re-suspend $n/5 in 10s (chain self-heal)"
+      systemd-run --unit="mbp132-resuspend-$n" --on-active=10 --quiet \
+        /bin/bash -c 'exec >/dev/null 2>&1; grep -q closed /proc/acpi/button/lid/LID0/state && systemctl suspend' 2>/dev/null \
+        || log "post: WARNING could not schedule re-suspend"
+    else
+      log "post: early wake chain survived 5 re-suspends - staying awake (power button suspend to retry)"
+    fi
+  fi
+  log "post: done"
+  ;;
+*) echo "usage: $0 pre|post" >&2; exit 2 ;;
+esac
+exit 0

@@ -1,0 +1,3 @@
+# MacBookPro13,2: Apple S3X NVMe (106b:2003) must not enter D3cold or the
+# machine does not wake from suspend (Dunedan/mbp-2016-linux).
+ACTION=="add|bind|change", SUBSYSTEM=="pci", ATTR{vendor}=="0x106b", ATTR{device}=="0x2003", ATTR{d3cold_allowed}="0"

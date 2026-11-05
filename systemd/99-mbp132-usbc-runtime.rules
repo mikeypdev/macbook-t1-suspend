@@ -1,0 +1,5 @@
+# MacBookPro13,2: USB-C hotplug is missed while the Alpine Ridge xHCI is
+# runtime-suspended. Keep the USB3 ROOT hub of BOTH Alpine Ridge xHCIs
+# (Intel 8086:15d4) awake. Matched by ID, not PCI address: addresses change
+# after the sleep-time Thunderbolt rescan. May cost some idle battery.
+ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", KERNEL=="usb*", ATTR{devpath}=="0", ATTR{idVendor}=="1d6b", ATTR{idProduct}=="0003", SUBSYSTEMS=="pci", ATTRS{vendor}=="0x8086", ATTRS{device}=="0x15d4", TEST=="power/control", ATTR{power/control}="on"
