@@ -87,6 +87,7 @@ the requested seconds; EARLY WAKE lines indicate a new wake source.
 | `systemd/50-mbp132-s3.conf` | systemd-suspend.service.d | ExecStartPre/ExecStopPost = the hook |
 | `systemd/61-mbp132-nvme-d3cold.rules` | /etc/udev/rules.d | NVMe d3cold_allowed=0 |
 | `systemd/99-mbp132-usbc-runtime.rules` + `systemd/macbook-usbc-runtime.service` | udev/systemd | keep Alpine Ridge USB3 root hubs runtime-awake (USB-C hotplug detection) |
+| `hooks/macbook-pcie-aspm-l1` + `systemd/macbook-pcie-aspm-l1.service` | /usr/local/sbin + systemd | enable PCIe ASPM L1 (LnkCtl bit 1) on validated links at boot, re-applied after every resume by the sleep hook: Apple firmware ships ASPM disabled and never grants Linux _OSC control (policy write = EPERM) even though both link ends advertise L1 (macOS enables it). Measured −2.2 W awake on battery (journal tag: macbook-aspm) |
 | `wifi-recover` | /usr/local/sbin | Wi-Fi recovery ladder: brcmfmac rebind → PCI remove/rescan → ARPT root-port D3cold cycle; manual `sudo wifi-recover [-y]`, also driven automatically by the watchdog |
 | `test/mbp132-auto-test.sh` | — | unattended S3 test: RTC self-wake, wake-source capture, GPE deltas, T1/TBT/wifi verdicts → `logs/latest` |
 | apple-ib-drv (external, `MBP_T1_DRVDIR`) | DKMS apple-ib-drv/0.1 | apple-ibridge + apple-touchbar + macbook_t1_socw |
@@ -115,9 +116,17 @@ plus two ACPI GPE storms. What was found and done:
 | `gpe17` storm, intermittent bursts ~75/s. gpe17 is **SPIT (apple-spi-topcase) GPE** = the keyboard/touchpad data interrupt (applespi installs a GPE handler) — same ghost-event hardware quirk as the known S3 SPIT instant-wake | NOT disabled — would kill keyboard+trackpad input |
 | Apple S3X NVMe: **APST unsupported** (`get-feature 0x0c` = Invalid Field) — the `nvme_core.default_ps_max_latency_us` advice floating around is useless here (0 would *disable* APST anyway); drive stays 100% runtime-active | none possible; d3cold already forbidden (wake bug), D3hot runtime is enabled by default but the drive never idles long enough |
 | BCM43602 wifi always active, 802.11 PSM off | deliberate (PSM firmware hang, see 30-wifi.conf) — ~0.5-1 W inherent cost |
-| Both Alpine Ridge TBT controllers 100% runtime-active with `control=auto` | pinned root hubs are the repo's deliberate hotplug tradeoff; the TBT PCI functions themselves stay awake (driver holds them) |
+| Every PCIe link ran with ASPM disabled. The earlier "TBT has no ASPM in LnkCap" reading was wrong — both ends of the NVMe/wifi/TBT links advertise L1; Apple firmware just never enables it and never grants Linux _OSC ASPM control (`policy` write = EPERM, `pcie_aspm.policy=powersave` is a no-op) | `macbook-pcie-aspm-l1` (boot + every resume): setpci LnkCtl L1 on 10 vendor:device ids. Measured: −1.4 W TBT chains, −0.6 W wifi link (NVMe link already L1 from firmware); busy-session draw 10.5 → 8.3 W |
+| Both Alpine Ridge TBT controllers 100% runtime-active with `control=auto` | mostly inherent now: with L1 on, letting the TBT xHCIs runtime-suspend (root hubs unpinned) added only ~0.2 W in testing — kept the pinned-hubs hotplug tradeoff. USB2 devices (tested: AX88772 dongles, iPhone over a USB2 C-C cable) route via the internal xHCI and hotplug fine either way; the USB3-device path through a suspended Alpine Ridge xHCI could not be tested (no USB3 C-C cable) |
 | GNOME auto-brightness on → iio-sensor-proxy polls 2 ALS → HID sensor device never powers down | left as-is (user feature); turn off auto-brightness to power-gate it |
 | syncthing (~25 wakeups/s over 5 procs), 1Password, terminals | userspace; biggest wakeup source after this session itself |
+
+Result after both passes (2026-11-06): **busy-session draw on battery 8.3 W**
+(10.5 W before ASPM L1, 12.8 W after the first pass; see intro for the
+starting range; macOS idles <5 W with everything closed). The NHIs behind
+both TBT controllers still never runtime-suspend even with everything idle
+(module params `xdomain`/`clx` are read-only 0444; a `thunderbolt.xdomain=N`
+boot arg is the untested next lever, worth ~0.2-0.5 W at most).
 
 ## Known limitations
 
@@ -133,3 +142,7 @@ plus two ACPI GPE storms. What was found and done:
   to `hw:0,0`/`plughw:0,0` — no hardware volume control (VERY loud).
 - gsettings `caps:escape` (interim ESC workaround) can be reset now:
   `gsettings reset org.gnome.desktop.input-sources xkb-options`.
+- PCIe ASPM L1 is applied by setpci (`macbook-pcie-aspm-l1`) because firmware
+  never grants Linux _OSC ASPM control. If a firmware/kernel update ever
+  starts granting it (`policy` write stops returning EPERM), prefer native
+  `pcie_aspm.policy=powersave` and drop the unit.

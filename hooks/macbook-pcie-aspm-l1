@@ -1,0 +1,48 @@
+#!/bin/bash
+# MacBookPro13,2: enable PCIe ASPM L1 (LnkCtl bit 1) on validated links.
+# Apple firmware leaves ASPM disabled on every link it controls and never
+# grants Linux _OSC ASPM control (so /sys/module/pcie_aspm/parameters/policy
+# is EPERM and pcie_aspm.policy=powersave changes nothing) - yet both link
+# ends DO advertise L1 in LnkCap, and macOS enables L1 on these same links.
+# Writing the config bits directly is the software equivalent.
+# Measured 2026-11-06, awake on battery: 10.5 W -> 8.3 W busy-session draw
+# (~-1.4 W from the two Thunderbolt chains, ~-0.6 W from the wifi link; the
+# NVMe root-port link already ships L1-enabled from firmware). L1 alone
+# recovers nearly everything: unpinning the Alpine Ridge root hubs too (xHCI
+# runtime suspend) adds only ~0.2 W and risks USB-C hotplug - not done.
+# Matching is by vendor:device id, NOT PCI address: the sleep-time TBT
+# remove/rescan renumbers the TBT tree. Idempotent, never fails sleep flows.
+# Runs from macbook-pcie-aspm-l1.service (boot) and macbook-sleep-hook post.
+# Journal tag: macbook-aspm.
+set -u
+TAG=macbook-aspm
+log() { logger -t "$TAG" -- "$*"; }
+[[ $(cat /sys/class/dmi/id/product_name 2>/dev/null) == MacBookPro13,2 ]] || exit 0
+
+# (vendor:device) ids whose links are validated for L1 on this model:
+#  Sunrise Point-LP root ports #1/#5/#9/#12 (NVMe / DSL6540 / JHL6540 / wifi),
+#  Apple S3X NVMe, BCM43602 wifi, DSL6540 + JHL6540 bridges, NHI, TBT xHCI
+IDS="8086:9d10 8086:9d14 8086:9d18 8086:9d1b 106b:2003 14e4:43ba 8086:1578 8086:15d3 8086:15d2 8086:15d4"
+
+command -v setpci >/dev/null 2>&1 || { log "ERROR setpci not found"; exit 0; }
+
+changed=0 already=0 nol1=0
+for d in /sys/bus/pci/devices/*; do
+  v=$(cat "$d/vendor" 2>/dev/null); s=$(cat "$d/device" 2>/dev/null)
+  id="${v#0x}:${s#0x}"
+  case " $IDS " in *" $id "*) ;; *) continue ;; esac
+  a=${d##*/}
+  cap=$(setpci -s "$a" CAP_EXP+0c.L 2>/dev/null) || continue
+  [[ -n $cap ]] || continue
+  (( 0x$cap & 0x800 )) || { nol1=$((nol1 + 1)); continue; }  # LnkCap bit 11 = L1
+  ctl=$(setpci -s "$a" CAP_EXP+10.w 2>/dev/null) || continue
+  if (( 0x$ctl & 0x2 )); then already=$((already + 1)); continue; fi
+  if setpci -s "$a" CAP_EXP+10.w=$(printf '%04x' $(( 0x$ctl | 0x2 ))); then
+    changed=$((changed + 1))
+  else
+    log "WARNING could not set L1 on $a ($id)"
+  fi
+done
+echo "ASPM L1: set on $changed device(s), $already already set, $nol1 without L1 cap"
+log "L1: set=$changed already=$already nol1=$nol1"
+exit 0

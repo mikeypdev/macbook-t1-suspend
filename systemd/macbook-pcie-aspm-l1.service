@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply MacBook PCIe ASPM L1 (Apple firmware ships it disabled)
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecCondition=/usr/bin/grep -qx MacBookPro13,2 /sys/class/dmi/id/product_name
+# Firmware leaves ASPM off and never grants Linux _OSC control; both link
+# ends still advertise L1 (macOS enables it). ~-2 W awake on battery.
+ExecStart=/usr/local/sbin/macbook-pcie-aspm-l1
+TimeoutStartSec=30
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

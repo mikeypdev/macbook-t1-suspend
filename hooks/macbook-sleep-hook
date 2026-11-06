@@ -32,7 +32,10 @@
 #       restore codec autosuspend delay + audio card profile (audio comes
 #       back on first playback - the patched cs8409 re-runs boot setup);
 #       re-send Touch Bar mode (driver cache is stale after reset-resume):
-#       idle_timeout -2 then back to its saved value.
+#       idle_timeout -2 then back to its saved value; re-apply PCIe ASPM L1
+#       (macbook-pcie-aspm-l1): the TBT tree links are re-initialized by the
+#       remove/rescan and come back at firmware defaults (L1 off), which
+#       would silently lose ~2 W of the battery fix.
 # SOCW is skipped (logged) if the module is missing/unloadable; never blocks sleep.
 # Journal tag: macbook-sleep. Every path except the NVMe guard exits 0.
 set -u
@@ -245,6 +248,12 @@ post)
     rm -f "$STATE/codec-profile"
   fi
   touchbar_refresh
+  # PCIe ASPM L1 does not survive the TBT remove/rescan (re-initialized links
+  # come back at firmware defaults). Re-apply; never blocks the resume flow.
+  if [[ -x /usr/local/sbin/macbook-pcie-aspm-l1 ]]; then
+    macbook-pcie-aspm-l1 >/dev/null 2>&1 \
+      || log "post: WARNING macbook-pcie-aspm-l1 failed"
+  fi
   # Self-heal for the intermittent S3 instant-wake chain (platform quirk,
   # same on the reference machine - see docs/SLEEP.md "14:05-14:10" and its
   # known-issues): a rare unattributed trigger wakes S3 ~3-4 s in, the short

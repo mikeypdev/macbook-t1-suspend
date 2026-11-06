@@ -118,6 +118,19 @@ TBATTR=$(ls /sys/devices/pci0000:00/0000:00:14.0/usb1/1-3/*/*/*/idle_timeout 2>/
 tlp start 2>/dev/null || true
 echo "    TLP: $(tlp-stat -s 2>/dev/null | grep 'TLP profile')"
 
+echo "==> 7b/8 Power: PCIe ASPM L1 on validated links (~-2 W awake on battery)"
+# Apple firmware leaves ASPM disabled on every link it controls and never
+# grants Linux _OSC ASPM control (policy writes fail EPERM), but both link
+# ends advertise L1 in LnkCap - macOS enables it on the same links. setpci on
+# the config bits is the only lever; matched by vendor:device id because the
+# sleep-time TBT remove/rescan renumbers the TBT tree. The sleep hook
+# re-applies it after every resume (links reset to firmware defaults).
+install -m 755 "$SRC/hooks/macbook-pcie-aspm-l1" /usr/local/sbin/macbook-pcie-aspm-l1
+install -m 644 "$SRC/systemd/macbook-pcie-aspm-l1.service" /etc/systemd/system/macbook-pcie-aspm-l1.service
+systemctl daemon-reload
+systemctl enable --now macbook-pcie-aspm-l1.service
+/usr/local/sbin/macbook-pcie-aspm-l1
+
 echo "==> 8/8 Verification"
 echo "    mem_sleep (current boot): $(cat /sys/power/mem_sleep)  (deep only after reboot)"
 echo "    socw module: $(modinfo -k "$(uname -r)" -n macbook_t1_socw 2>/dev/null || echo MISSING)"
