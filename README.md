@@ -92,9 +92,32 @@ the requested seconds; EARLY WAKE lines indicate a new wake source.
 | apple-ib-drv (external, `MBP_T1_DRVDIR`) | DKMS apple-ib-drv/0.1 | apple-ibridge + apple-touchbar + macbook_t1_socw |
 | `cs8409-resume-fix/` | /usr/src/snd_hda_macbookpro-0.1 (patch_cirrus/) | CS8409 audio resume fix: re-runs Apple boot setup after S3 (port of Fedora patch 0002; param `resume_reinit`) |
 | `systemd/tlp-20-usb.conf` | /etc/tlp.d/20-usb.conf | TLP: USB autosuspend denylist by USB id (1d6b:0003 root hubs) so Alpine Ridge USB-C hotplug stays working (PCI id in stock config matched nothing) |
+| `systemd/tlp-40-battery.conf` | /etc/tlp.d/40-battery.conf | TLP: battery-mode CPU tuning — EPP `power`, turbo off, PCIe runtime PM (idle draw was ~3x macOS) |
+| `systemd/50-mbp132-touchbar-idle.conf` | /etc/modprobe.d/50-mbp132-touchbar-idle.conf | apple_touchbar `idle_timeout=30`: strip display sleeps 30 s after last activity (T1 USB itself can never runtime-suspend — gnome-shell holds the input node open) |
+| `apple-ib-t1-idle-off.patch` | /usr/src/apple-ib-drv-0.1 (apple-touchbar.c) | T1 driver fix: idle timeout now blanks the strip via MODE_SET (display ops are a no-op on T1, so the stock idle logic never actually turned it off); input restores the fn mode |
 | `systemd/tlp-30-wifi.conf` | /etc/tlp.d/30-wifi.conf | TLP: disable 802.11 power save (BCM43602 PSM watchdog firmware hang); boot-time only — the NM conf below covers the resume re-probe |
 | `systemd/networkmanager-wifi-powersave.conf` | /etc/NetworkManager/conf.d/macbook-wifi-powersave.conf | NetworkManager: wifi.powersave=1 — NM re-applies its setting at every wifi device init (i.e. every resume re-probe), after TLP already ran; without this, power save comes back on at each resume |
 | `firmware/brcmfmac43602-pcie.txt` | /lib/firmware/brcm/ | Broadcom BCM43602 NVRAM (macaddr zeroed — the driver uses the real MAC anyway) |
+
+## Power / battery (2026-11-06 audit)
+
+Measured on battery with a GNOME session: **~11-15 W draw, CPU package only
+~2.7 W of it**; package idled at PC3 (never PC6+); macOS idles this machine
+at <5 W. The gap is not the CPU governor — it is a set of always-on devices
+plus two ACPI GPE storms. What was found and done:
+
+| Finding | Action |
+|---|---|
+| `/etc/tlp.conf:500` had a stale hand-edited `USB_DENYLIST="8086:15d4"`; TLP 1.10 reads tlp.conf AFTER tlp.d, so it silently overrode `20-usb.conf` on every TLP run → Alpine Ridge root hubs back to `auto` (the USB-C hotplug fix was defeated) | installer step 7/8 comments the line out; 20-usb.conf owns the denylist |
+| Battery profile used stock TLP defaults (EPP `balance_power`, turbo on) | `tlp-40-battery.conf`: EPP `power`, `CPU_BOOST_ON_BAT=0`, `RUNTIME_PM_ON_BAT=auto` |
+| Touch bar strip stayed lit forever: idle timeouts called `appletb_set_tb_disp()`, which is a **deliberate no-op on T1** ("no separate display-control interface") — the driver believed it blanked the strip. Input events were quiet (verified: no ghost-event stream), so it wasn't chatter keeping it awake; the T1 (iBridge `05ac:8600`) USB also never runtime-suspends (gnome-shell holds the input node open) | `apple-ib-t1-idle-off.patch`: idle timeout now sends `MODE_OFF` via the mode-set path (same command suspend uses); next input restores the fn mode. T1 USB suspend itself would need libinput ignoring the device (kills Fn-row keys) or SOCW experiments (known T1 freeze territory) — not attempted |
+| `gpe07` storm, ~10-35/s on battery. gpe07 is the **EC (PNP0C09) GPE**; its queries carry lid (`_Q20`), AC-adapter (`_Q21`), battery (`_Q10`), sleep-button (`_Q5A`) events | NOT disabled — would break lid close/open and AC plug detection. Rate correlates with battery discharge (SMC telemetry). Cost is modest; wakeups show as `acpi_ec_event_processor` |
+| `gpe17` storm, intermittent bursts ~75/s. gpe17 is **SPIT (apple-spi-topcase) GPE** = the keyboard/touchpad data interrupt (applespi installs a GPE handler) — same ghost-event hardware quirk as the known S3 SPIT instant-wake | NOT disabled — would kill keyboard+trackpad input |
+| Apple S3X NVMe: **APST unsupported** (`get-feature 0x0c` = Invalid Field) — the `nvme_core.default_ps_max_latency_us` advice floating around is useless here (0 would *disable* APST anyway); drive stays 100% runtime-active | none possible; d3cold already forbidden (wake bug), D3hot runtime is enabled by default but the drive never idles long enough |
+| BCM43602 wifi always active, 802.11 PSM off | deliberate (PSM firmware hang, see 30-wifi.conf) — ~0.5-1 W inherent cost |
+| Both Alpine Ridge TBT controllers 100% runtime-active with `control=auto` | pinned root hubs are the repo's deliberate hotplug tradeoff; the TBT PCI functions themselves stay awake (driver holds them) |
+| GNOME auto-brightness on → iio-sensor-proxy polls 2 ALS → HID sensor device never powers down | left as-is (user feature); turn off auto-brightness to power-gate it |
+| syncthing (~25 wakeups/s over 5 procs), 1Password, terminals | userspace; biggest wakeup source after this session itself |
 
 ## Known limitations
 

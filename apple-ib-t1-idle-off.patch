@@ -1,0 +1,30 @@
+# T1 (MacBookPro13,2): idle-timeout power-down via mode-set.
+# appletb_set_tb_disp() is a deliberate no-op on T1, so the idle logic
+# "succeeded" without ever blanking the strip. Send MODE_OFF instead (the
+# same command appletb_suspend uses); the next input event restores the
+# fn mode. Apply to /usr/src/apple-ib-drv-0.1/apple-touchbar.c, then:
+#   dkms remove apple-ib-drv/0.1 --all && dkms install apple-ib-drv/0.1 -k $(uname -r)
+#   rmmod apple_touchbar && modprobe apple_touchbar
+# Backup of the pre-patch file: apple-touchbar.c.bak-t1-idle-off (same dir).
+@@ -459,7 +459,20 @@
+ 		/* dim or idle timeout reached */
+ 		int next_disp = (time_to_off == 0) ? APPLETB_CMD_DISP_OFF :
+ 						     APPLETB_CMD_DISP_DIM;
+-		if (next_disp != current_disp &&
++		if (tb_dev->is_t1 && time_to_off == 0) {
++			/*
++			 * T1 has no display control - appletb_set_tb_disp() is a
++			 * no-op there, so idle timeouts never blanked the strip.
++			 * Power it down via the mode-set instead - the same command
++			 * appletb_suspend() sends. The next input event restores
++			 * the fn mode (see appletb_update_touchbar_no_lock).
++			 */
++			if (appletb_set_tb_mode(tb_dev, APPLETB_CMD_MODE_OFF) == 0) {
++				spin_lock_irqsave(&tb_dev->tb_lock, flags);
++				tb_dev->cur_tb_mode = APPLETB_CMD_MODE_OFF;
++				spin_unlock_irqrestore(&tb_dev->tb_lock, flags);
++			}
++		} else if (next_disp != current_disp &&
+ 		    appletb_set_tb_disp(tb_dev, next_disp) == 0) {
+ 			spin_lock_irqsave(&tb_dev->tb_lock, flags);
+ 			tb_dev->cur_tb_disp = next_disp;
