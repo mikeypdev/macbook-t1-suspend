@@ -112,7 +112,7 @@ plus two ACPI GPE storms. What was found and done:
 | `/etc/tlp.conf:500` had a stale hand-edited `USB_DENYLIST="8086:15d4"`; TLP 1.10 reads tlp.conf AFTER tlp.d, so it silently overrode `20-usb.conf` on every TLP run → Alpine Ridge root hubs back to `auto` (the USB-C hotplug fix was defeated) | installer step 7/8 comments the line out; 20-usb.conf owns the denylist |
 | Battery profile used stock TLP defaults (EPP `balance_power`, turbo on) | `tlp-40-battery.conf`: EPP `power`, `CPU_BOOST_ON_BAT=0`, `RUNTIME_PM_ON_BAT=auto` |
 | Touch bar strip stayed lit forever: idle timeouts called `appletb_set_tb_disp()`, which is a **deliberate no-op on T1** ("no separate display-control interface") — the driver believed it blanked the strip. Input events were quiet (verified: no ghost-event stream), so it wasn't chatter keeping it awake; the T1 (iBridge `05ac:8600`) USB also never runtime-suspends (gnome-shell holds the input node open) | `apple-ib-t1-idle-off.patch`: idle timeout now sends `MODE_OFF` via the mode-set path (same command suspend uses); next input restores the fn mode. T1 USB suspend itself would need libinput ignoring the device (kills Fn-row keys) or SOCW experiments (known T1 freeze territory) — not attempted |
-| `gpe07` storm, ~10-35/s on battery. gpe07 is the **EC (PNP0C09) GPE**; its queries carry lid (`_Q20`), AC-adapter (`_Q21`), battery (`_Q10`), sleep-button (`_Q5A`) events | NOT disabled — would break lid close/open and AC plug detection. Rate correlates with battery discharge (SMC telemetry). Cost is modest; wakeups show as `acpi_ec_event_processor` |
+| `gpe07` storm, ~10-35/s on battery. gpe07 is the **EC (PNP0C09) GPE**; its queries carry lid (`_Q20`), AC-adapter (`_Q21`), battery (`_Q10`), sleep-button (`_Q5A`) events | NOT disabled — would break lid close/open and AC plug detection. Rate correlates with battery discharge (SMC telemetry). Cost is modest; wakeups show as `acpi_ec_event_processor`. **Measured the hard way (2026-11-06): `echo disable > gpe07` causes a ~2500/s SCI storm (level-triggered, stuck-asserted), and after a disable+resume cycle the EC path degrades — SMC reads take ~270 ms instead of ~5 ms, upowerd/gnome-shell chug, ~35% phantom PSI io pressure. Re-enabling stops the storm; full recovery needed a reboot. Never disable these two.** |
 | `gpe17` storm, intermittent bursts ~75/s. gpe17 is **SPIT (apple-spi-topcase) GPE** = the keyboard/touchpad data interrupt (applespi installs a GPE handler) — same ghost-event hardware quirk as the known S3 SPIT instant-wake | NOT disabled — would kill keyboard+trackpad input |
 | Apple S3X NVMe: **APST unsupported** (`get-feature 0x0c` = Invalid Field) — the `nvme_core.default_ps_max_latency_us` advice floating around is useless here (0 would *disable* APST anyway); drive stays 100% runtime-active | none possible; d3cold already forbidden (wake bug), D3hot runtime is enabled by default but the drive never idles long enough |
 | BCM43602 wifi always active, 802.11 PSM off | deliberate (PSM firmware hang, see 30-wifi.conf) — ~0.5-1 W inherent cost |
@@ -127,6 +127,40 @@ starting range; macOS idles <5 W with everything closed). The NHIs behind
 both TBT controllers still never runtime-suspend even with everything idle
 (module params `xdomain`/`clx` are read-only 0444; a `thunderbolt.xdomain=N`
 boot arg is the untested next lever, worth ~0.2-0.5 W at most).
+
+### Session-3 deep dive: where the remaining watts sit (2026-11-06)
+
+Clean-boot re-measurement with the fixes in place (awake, battery, GNOME,
+interactive: ~11.3 W quiet / ~13.9 W active; the crush session itself is
+~1.5-2 W of that). Decomposition of the rest:
+
+- **Panel backlight** (`acpi_video0`): 15→38 (of 90) = +0.35 W, 38→60 =
+  +1.9 W, 60→90 = +0.6 W. Full range ~2.8 W. Dropping one notch below 38
+  is nearly free; 38→60 is the expensive step.
+- **Keyboard backlight** (`spi::kbd_backlight`, via T1): 0→72/255 =
+  **+0.6 W**. Nothing auto-dims it on Linux; `echo 0` into the sysfs file
+  when you don't need it.
+- **Display pipeline floor**: eDP panel has no PSR (DPCD 1.1, debugfs
+  `i915_edp_psr_status` = ENODEV) and display DC5/DC6 was entered 3 times
+  total since boot — the display engine refreshes from memory every frame,
+  always. Unfixable without a PSR-capable panel/link.
+- **Package C-states never reach PC8+** (PC2 7.5%, PC3 3.6%, PC6 7.2%,
+  PC7 1.1%, PC8+ 0.0% measured while cores individually hit C7/C8 and the
+  GPU sat in RC6 at 300 MHz with 0 IRQ/s). The deep package states are
+  gated by the always-on display power well (no PSR), the never-suspending
+  TBT NHIs, and the ~70/s EC/GPE traffic. This is the structural gap to
+  macOS' <5 W idle; no Linux-side lever found.
+- **Phantom iowait is EC latency, not storage**: ~35% PSI io pressure and
+  20-30% `top` wa with *zero* block IO on every boot measured. The
+  blocked tasks are EC/SPI work (`spi2`, `kec_query`, `upowerd`,
+  `kworker i915_flip` briefly). Cosmetic for power, but explains odd
+  load/pressure readings — don't chase it.
+- **A long-lived boot accumulates GPU interrupt load that a reboot
+  clears**: after ~24 h up + a sleep cycle, i915 fired 228/s with a fully
+  static screen (680/s active) and powertop showed leaked DRM clients;
+  after reboot the same static desktop is 0/s. If i915 dominates
+  `/proc/interrupts` on a quiet screen, reboot.
+
 
 ## Known limitations
 
