@@ -117,7 +117,7 @@ plus two ACPI GPE storms. What was found and done:
 | Apple S3X NVMe: **APST unsupported** (`get-feature 0x0c` = Invalid Field) — the `nvme_core.default_ps_max_latency_us` advice floating around is useless here (0 would *disable* APST anyway); drive stays 100% runtime-active | none possible; d3cold already forbidden (wake bug), D3hot runtime is enabled by default but the drive never idles long enough |
 | BCM43602 wifi always active, 802.11 PSM off | deliberate (PSM firmware hang, see 30-wifi.conf) — ~0.5-1 W inherent cost |
 | Every PCIe link ran with ASPM disabled. The earlier "TBT has no ASPM in LnkCap" reading was wrong — both ends of the NVMe/wifi/TBT links advertise L1; Apple firmware just never enables it and never grants Linux _OSC ASPM control (`policy` write = EPERM, `pcie_aspm.policy=powersave` is a no-op) | `macbook-pcie-aspm-l1` (boot + every resume): setpci LnkCtl L1 on 10 vendor:device ids. Measured: −1.4 W TBT chains, −0.6 W wifi link (NVMe link already L1 from firmware); busy-session draw 10.5 → 8.3 W |
-| Both Alpine Ridge TBT controllers 100% runtime-active with `control=auto` | mostly inherent now: with L1 on, letting the TBT xHCIs runtime-suspend (root hubs unpinned) added only ~0.2 W in testing — kept the pinned-hubs hotplug tradeoff. USB2 devices (tested: AX88772 dongles, iPhone over a USB2 C-C cable) route via the internal xHCI and hotplug fine either way; the USB3-device path through a suspended Alpine Ridge xHCI could not be tested (no USB3 C-C cable) |
+| Both Alpine Ridge TBT controllers 100% runtime-active with `control=auto` (first audit, pre-ASPM-L1) | with L1 + runtime PM as shipped, the four empty hotplug bridges (`04:01/04:04`/`7a:01/7a:04`) do runtime-suspend; NHIs and the pinned xHCIs stay awake. `thunderbolt.xdomain=N` was A/B-tested (two clean back-to-back boots: 9.46 W without vs 9.64 W with — no measurable win, and bridge behavior identical) so it is NOT adopted; S3 sleep test passed while it was set, for the record. Letting the TBT xHCIs themselves runtime-suspend (root hubs unpinned) added only ~0.2 W in earlier testing — the pinned-hubs hotplug tradeoff stays. USB2 hotplug is unaffected either way (internal xHCI); USB3 path still untestable (no USB3 C-C cable) |
 | GNOME auto-brightness on → iio-sensor-proxy polls 2 ALS → HID sensor device never powers down | left as-is (user feature); turn off auto-brightness to power-gate it |
 | syncthing (~25 wakeups/s over 5 procs), 1Password, terminals | userspace; biggest wakeup source after this session itself |
 
@@ -125,8 +125,8 @@ Result after both passes (2026-11-06): **busy-session draw on battery 8.3 W**
 (10.5 W before ASPM L1, 12.8 W after the first pass; see intro for the
 starting range; macOS idles <5 W with everything closed). The NHIs behind
 both TBT controllers still never runtime-suspend even with everything idle
-(module params `xdomain`/`clx` are read-only 0444; a `thunderbolt.xdomain=N`
-boot arg is the untested next lever, worth ~0.2-0.5 W at most).
+(module params `xdomain`/`clx` are read-only 0444); `thunderbolt.xdomain=N`
+was A/B-tested and showed no measurable draw change — not adopted.
 
 ### Session-3 deep dive: where the remaining watts sit (2026-11-06)
 
@@ -138,18 +138,24 @@ interactive: ~11.3 W quiet / ~13.9 W active; the crush session itself is
   +1.9 W, 60→90 = +0.6 W. Full range ~2.8 W. Dropping one notch below 38
   is nearly free; 38→60 is the expensive step.
 - **Keyboard backlight** (`spi::kbd_backlight`, via T1): 0→72/255 =
-  **+0.6 W**. Nothing auto-dims it on Linux; `echo 0` into the sysfs file
-  when you don't need it.
+  **+0.6 W**. No auto-dim while awake, but it does turn off automatically
+  when the screen blanks (GNOME/gsd), so it costs nothing in the blank
+  state; `echo 0` into the sysfs file when unused while working.
 - **Display pipeline floor**: eDP panel has no PSR (DPCD 1.1, debugfs
   `i915_edp_psr_status` = ENODEV) and display DC5/DC6 was entered 3 times
   total since boot — the display engine refreshes from memory every frame,
   always. Unfixable without a PSR-capable panel/link.
-- **Package C-states never reach PC8+** (PC2 7.5%, PC3 3.6%, PC6 7.2%,
-  PC7 1.1%, PC8+ 0.0% measured while cores individually hit C7/C8 and the
-  GPU sat in RC6 at 300 MHz with 0 IRQ/s). The deep package states are
-  gated by the always-on display power well (no PSR), the never-suspending
-  TBT NHIs, and the ~70/s EC/GPE traffic. This is the structural gap to
-  macOS' <5 W idle; no Linux-side lever found.
+- **Package C-states never reach PC8+ — even with the screen blank.**
+  Screen-on: PC2 7.5%, PC3 3.6%, PC6 7.2%, PC7 1.1%, PC8+ 0.0% (while
+  cores individually hit C7/C8 and the GPU sat in RC6 at 300 MHz with
+  0 IRQ/s). During a 20-min blank the picture improved (PC6 25.6%, GPU
+  powered-on 26%→9%) but PC8/9/10 stayed 0.0% — so the deep package states
+  are gated by the never-suspending TBT NHIs, the ~70/s EC/GPE traffic and
+  the PSM-off wifi, *not* by the display (later verified: with
+  `thunderbolt.xdomain=N` the NHIs still never suspend and PC8+ stays
+  0.0%). The structural gap to macOS' <5 W idle has no remaining
+  Linux-side lever found. Blank itself is still the single biggest awake
+  lever: **13.5 W active → 5.4 W** blanked on battery.
 - **Phantom iowait is EC latency, not storage**: ~35% PSI io pressure and
   20-30% `top` wa with *zero* block IO on every boot measured. The
   blocked tasks are EC/SPI work (`spi2`, `kec_query`, `upowerd`,

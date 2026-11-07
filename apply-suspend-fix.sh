@@ -12,9 +12,9 @@ DKMSSRC=/usr/src/apple-ib-drv-0.1
 echo "==> 1/8 GRUB: back to real S3 (deep), drop pcie_port_pm=off"
 GRUB=/etc/default/grub
 cp "$GRUB" "$GRUB.bak-s3fix" 2>/dev/null || true
-sed -i 's/ mem_sleep_default=s2idle//; s/ pcie_port_pm=off//' "$GRUB"
+sed -i 's/ mem_sleep_default=s2idle//; s/ pcie_port_pm=off//; s/ thunderbolt.xdomain=N//' "$GRUB"
 grep -q 'mem_sleep_default=deep' "$GRUB" || sed -i 's/^\(GRUB_CMDLINE_LINUX_DEFAULT="[^"]*\)"/\1 mem_sleep_default=deep"/' "$GRUB"
-grep -q 'mem_sleep_default=deep' "$GRUB" && ! grep -Eq 'mem_sleep_default=s2idle|pcie_port_pm=off' "$GRUB" \
+grep -q 'mem_sleep_default=deep' "$GRUB" && ! grep -Eq 'mem_sleep_default=s2idle|pcie_port_pm=off|thunderbolt.xdomain' "$GRUB" \
     || { echo "ERROR: failed to edit $GRUB" >&2; exit 1; }
 grep '^GRUB_CMDLINE_LINUX_DEFAULT' "$GRUB"
 grub-mkconfig -o /boot/grub/grub.cfg
