@@ -5,7 +5,17 @@
 # Recovery ladder (stops as soon as the interface is up):
 #   1. brcmfmac driver unbind/bind        (firmware hang, e.g. PSM watchdog)
 #   2. PCI remove + rescan of the card    (chip wedged: "MMIO read failed")
+#      - waits up to 25 s for NetworkManager to associate on the rescued
+#        card, then one gentle rebind, before any power cycling
 #   3. root-port D3cold cycle + rescan    (card not reappearing after rescan)
+#
+# 2026-11-09 20:47 lesson: level 2 used to wait a flat 5 s for association
+# before escalating - NetworkManager needs 5-15+ s on a freshly probed
+# device, so a chip that had come back HEALTHY got the level-3 root-port
+# power cycle 5 s later, and that double power cycle wedged the firmware
+# (assoc rejects status 16 + EAPOL timeouts; reboot was the only way out).
+# Every level now waits for real association, and a rebind is preferred
+# over the root-port power cycle as long as the card is on the bus.
 #
 # Usage: sudo wifi-recover [-y]
 #   -y  non-interactive (default asks before escalating levels 2/3)
@@ -65,11 +75,12 @@ if [[ -n $DEV ]] && [[ -e /sys/bus/pci/devices/$DEV/driver ]]; then
   echo "$DEV" > /sys/bus/pci/drivers/brcmfmac/unbind 2>/dev/null
   sleep 1
   echo "$DEV" > /sys/bus/pci/drivers/brcmfmac/bind 2>/dev/null
-  sleep 10   # NetworkManager needs 5-15 s to re-associate after a rebind
-  if iface_up "$DEV"; then
-    log "OK: interface is up after rebind"
-    exit 0
-  fi
+  # NetworkManager needs 5-15 s to re-associate after a rebind - poll
+  # instead of one blind check at a flat 10 s
+  for _ in $(seq 1 20); do
+    sleep 1
+    iface_up "$DEV" && { log "OK: interface is up after rebind"; exit 0; }
+  done
   log "rebind did not restore the interface"
   show_state "$DEV"
   confirm "level 2 (PCI remove/rescan of $DEV)" || exit 1
@@ -84,11 +95,29 @@ else
   log "card not present in sysfs; trying plain rescan"
 fi
 echo 1 > /sys/bus/pci/rescan
-sleep 5
+sleep 3
 DEV=$(find_card)
-if [[ -n $DEV ]] && iface_up "$DEV"; then
-  log "OK: $DEV back after rescan"
-  exit 0
+if [[ -n $DEV ]]; then
+  log "level 2: $DEV back after rescan - waiting up to 25 s for association"
+  for _ in $(seq 1 25); do
+    sleep 1
+    iface_up "$DEV" && { log "OK: interface up on $DEV after rescan"; exit 0; }
+    [[ -e /sys/bus/pci/devices/$DEV ]] || break
+  done
+  if [[ -e /sys/bus/pci/devices/$DEV ]]; then
+    # Card on the bus but not associating: possibly wedged firmware. A
+    # driver rebind (fresh firmware download) is far gentler than the
+    # level-3 root-port D3cold cycle - try it before any power cycling.
+    log "level 2: $DEV present but not associating - one rebind before power cycling"
+    echo "$DEV" > /sys/bus/pci/drivers/brcmfmac/unbind 2>/dev/null
+    sleep 1
+    echo "$DEV" > /sys/bus/pci/drivers/brcmfmac/bind 2>/dev/null
+    for _ in $(seq 1 25); do
+      sleep 1
+      iface_up "$DEV" && { log "OK: interface up on $DEV after rebind"; exit 0; }
+      [[ -e /sys/bus/pci/devices/$DEV ]] || break
+    done
+  fi
 fi
 show_state "$DEV"
 
@@ -104,11 +133,20 @@ echo 0 > "/sys/bus/pci/devices/$PORT/d3cold_allowed" 2>/dev/null
 echo 1 > "/sys/bus/pci/devices/$PORT/remove" 2>/dev/null
 sleep 2
 echo 1 > /sys/bus/pci/rescan
-sleep 5
+sleep 3
 DEV=$(find_card)
-if [[ -n $DEV ]] && iface_up "$DEV"; then
-  log "OK: $DEV back after root-port power cycle"
-  exit 0
+if [[ -n $DEV ]]; then
+  log "level 3: $DEV back after root-port power cycle - waiting up to 25 s for association"
+  for _ in $(seq 1 25); do
+    sleep 1
+    iface_up "$DEV" && { log "OK: interface up on $DEV after root-port power cycle"; exit 0; }
+    [[ -e /sys/bus/pci/devices/$DEV ]] || break
+  done
+  if [[ -e /sys/bus/pci/devices/$DEV ]]; then
+    show_state "$DEV"
+    log "FAILED: $DEV on the bus but never associated - firmware wedged. Reboot (full power-off if a warm reboot is not enough)."
+    exit 2
+  fi
 fi
 
 show_state "$DEV"

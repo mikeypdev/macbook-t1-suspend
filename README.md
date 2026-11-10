@@ -57,6 +57,28 @@ standby. Based on the proven recipe from github.com/rcarmo/fedora-silverblue-mac
    (`macbook-wifi-watchdog`) that enforces power_save off, rebinds brcmfmac
    if nothing associated, then escalates through `wifi-recover` (PCI
    remove/rescan → ARPT root-port D3cold cycle).
+10. **Wi-Fi watchdog raced the resume and wedged a healthy chip (2026-11-09
+    20:47)** - three stacked bugs, all fixable without a reboot next time.
+    Sequence: lid closed 20:34, the instant-wake chain re-suspended the box
+    (issue 8) at 20:39:06 with the card PCI-removed; AC plugged in mid-sleep
+    (did NOT wake it - lid open at 20:47:22 did, gpe6F). (a) A watchdog
+    timer still pending from the resume before that re-suspend fired 0 s
+    into the thaw (`--on-active` deadlines stay pending across the sleep)
+    and saw "no wifi interface" while the card was deliberately removed.
+    (b) Its `wifi-recover` level-2 rescan brought the card back healthy,
+    but the flat 5 s association wait was shorter than NetworkManager's
+    5-15+ s bring-up, so it escalated to the level-3 ARPT root-port D3cold
+    cycle on a chip rescued 5 s earlier - and that double power cycle
+    wedged the firmware (assoc rejects status 16 + EAPOL timeouts, same
+    signature as 9b; reboot was the only way out). (c) The post hook's
+    attempt to schedule a watchdog for THIS resume failed ("unit already
+    loaded" - transient units linger until GC), so nothing self-healed.
+    Fixes: pre hook cancels pending watchdog timer+service at every suspend
+    entry; post hook unloads leftovers before rescheduling (idempotent);
+    the watchdog waits out the post-hook recovery before judging;
+    `wifi-recover` waits up to 25 s for association after every level and
+    prefers a driver rebind over the root-port power cycle while the card
+    is on the bus.
 
 ## Install
 
@@ -82,13 +104,13 @@ the requested seconds; EARLY WAKE lines indicate a new wake source.
 | `apply-suspend-fix.sh` | — | installer: GRUB `mem_sleep_default=deep` (no pcie_port_pm), sleep.conf, hooks, udev rules, DKMS rebuild |
 | `hooks/macbook-sleep-hook` | /usr/local/sbin | pre: force deep, NVMe guard, wifi PCI remove (rebind alone wedges the chip), CS8409 codec idle (profile off + autosuspend 0), TBT removal, XHC1/ARPT/SPIT/LID0(if lid open) wake masks, SOCW(0). post: SOCW(1), TBT rescan, wifi rescan + bind + power_save off, wake restores, codec profile restore, touchbar mode re-send (idle_timeout -2 → saved) |
 | `hooks/macbook-thunderbolt-remove-rescan` | /usr/local/sbin | TBT upstream-port removal before sleep + rescan/retries after (journal tag: thunderbolt-remove-rescan) |
-| `hooks/macbook-wifi-watchdog` | /usr/local/sbin | +45 s after every resume: enforce 802.11 power_save off (NM re-enables it on the re-probed device), rebind brcmfmac if nothing associated, then wifi-recover ladder (journal tag: macbook-sleep "watchdog:") |
+| `hooks/macbook-wifi-watchdog` | /usr/local/sbin | +45 s after every resume: enforce 802.11 power_save off (NM re-enables it on the re-probed device), rebind brcmfmac if nothing associated, then wifi-recover ladder; waits out the post-hook recovery before judging (journal tag: macbook-sleep "watchdog:") |
 | `systemd/90-mbp132-deep.conf` | /etc/systemd/sleep.conf.d | SuspendState=mem, MemorySleepMode=deep |
 | `systemd/50-mbp132-s3.conf` | systemd-suspend.service.d | ExecStartPre/ExecStopPost = the hook |
 | `systemd/61-mbp132-nvme-d3cold.rules` | /etc/udev/rules.d | NVMe d3cold_allowed=0 |
 | `systemd/99-mbp132-usbc-runtime.rules` + `systemd/macbook-usbc-runtime.service` | udev/systemd | keep Alpine Ridge USB3 root hubs runtime-awake (USB-C hotplug detection) |
 | `hooks/macbook-pcie-aspm-l1` + `systemd/macbook-pcie-aspm-l1.service` | /usr/local/sbin + systemd | enable PCIe ASPM L1 (LnkCtl bit 1) on validated links at boot, re-applied after every resume by the sleep hook: Apple firmware ships ASPM disabled and never grants Linux _OSC control (policy write = EPERM) even though both link ends advertise L1 (macOS enables it). Measured −2.2 W awake on battery (journal tag: macbook-aspm) |
-| `wifi-recover` | /usr/local/sbin | Wi-Fi recovery ladder: brcmfmac rebind → PCI remove/rescan → ARPT root-port D3cold cycle; manual `sudo wifi-recover [-y]`, also driven automatically by the watchdog |
+| `wifi-recover` | /usr/local/sbin | Wi-Fi recovery ladder: brcmfmac rebind → PCI remove/rescan → ARPT root-port D3cold cycle, with up to 25 s association wait per level (NM needs 5-15+ s on a freshly probed device) and a rebind preferred over power cycling while the card is on the bus; manual `sudo wifi-recover [-y]`, also driven automatically by the watchdog |
 | `test/mbp132-auto-test.sh` | — | unattended S3 test: RTC self-wake, wake-source capture, GPE deltas, T1/TBT/wifi verdicts → `logs/latest` |
 | apple-ib-drv (external, `MBP_T1_DRVDIR`) | DKMS apple-ib-drv/0.1 | apple-ibridge + apple-touchbar + macbook_t1_socw |
 | `cs8409-resume-fix/` | /usr/src/snd_hda_macbookpro-0.1 (patch_cirrus/) | CS8409 audio resume fix: re-runs Apple boot setup after S3 (port of Fedora patch 0002; param `resume_reinit`) |

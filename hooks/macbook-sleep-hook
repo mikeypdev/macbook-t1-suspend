@@ -7,6 +7,8 @@
 #       (ABORTS the suspend if that fails - known no-wake otherwise);
 #       unbind BCM43602 Wi-Fi from brcmfmac (firmware hangs across S3;
 #       post-rebind re-probes the existing firmware/NVRAM, which is untouched);
+#       cancel any pending Wi-Fi watchdog timer (a stale one fires 0 s into
+#       the next thaw and races the post rescan - 2026-11-09, README item 10);
 #       Thunderbolt upstream-port removal (keeps pcieport windows intact);
 #       disable S3 wake from XHC1 (00:14.0, hosts the T1/iBridge on usb 1-3;
 #       suspected instant-wake source) - keyboard SPIT and LID0 stay enabled;
@@ -26,8 +28,10 @@
 #       wake (its GPE 0x6F/GPD2 line asserts right after S3 entry -> 3 s
 #       "instant wake"); lid-closed suspends unchanged.
 # post: FIRST: ASOC.SOCW(1) (T1 keeps the Touch Bar dark after S3 without it);
-#       Thunderbolt rescan; rebind Wi-Fi (+45 s watchdog: power_save off,
-#       rebind + wifi-recover ladder if it never associates); restore XHC1
+#       Thunderbolt rescan; rebind Wi-Fi; schedule the +45 s Wi-Fi watchdog
+#       (power_save off, rebind + wifi-recover ladder if it never
+#       associates) after unloading leftover watchdog units (transient unit
+#       name collides until systemd GC catches up); restore XHC1
 #       wake to what it was;
 #       restore codec autosuspend delay + audio card profile (audio comes
 #       back on first playback - the patched cs8409 re-runs boot setup);
@@ -87,6 +91,15 @@ touchbar_refresh() {
 case "${1:-}" in
 pre)
   mkdir -p "$STATE"; rm -f "$STATE/wifi"; date +%s > "$STATE/entry-ts"
+  # A watchdog timer left over from the PREVIOUS resume is stale the
+  # moment we suspend again: its --on-active deadline is pending across
+  # the sleep and fires 0 s into the next thaw, while the card is still
+  # PCI-removed below - it then "sees" no wifi and races this hook's own
+  # post rescan (2026-11-09 20:47: level-3 power cycle wedged a healthy
+  # chip; reboot was needed). Kill timer + any running ladder; post
+  # schedules a fresh one for THIS resume.
+  systemctl stop mbp132-wifi-watchdog.timer mbp132-wifi-watchdog.service 2>/dev/null || true
+  systemctl reset-failed mbp132-wifi-watchdog.service 2>/dev/null || true
   grep -qw deep /sys/power/mem_sleep && echo deep > /sys/power/mem_sleep
   log "pre: mem_sleep: $(cat /sys/power/mem_sleep)"
   ok=0
@@ -212,6 +225,12 @@ post)
     # Watchdog 45 s after resume: enforce power_save off, rebind brcmfmac if
     # unassociated, then the wifi-recover ladder (needs wifi-recover +
     # macbook-wifi-watchdog installed in /usr/local/sbin).
+    # systemd-run fails with "unit already loaded" while a previous
+    # timer/service pair is still being GC'd (--collect unloads lazily) -
+    # the resume that most needs a watchdog then gets none (2026-11-09
+    # 20:47). Unload the leftovers first so scheduling is idempotent.
+    systemctl stop mbp132-wifi-watchdog.timer 2>/dev/null || true
+    systemctl reset-failed mbp132-wifi-watchdog.service 2>/dev/null || true
     systemd-run --unit=mbp132-wifi-watchdog --collect --on-active=45 --quiet \
       /usr/local/sbin/macbook-wifi-watchdog \
       || log "post: WARNING could not schedule Wi-Fi watchdog"

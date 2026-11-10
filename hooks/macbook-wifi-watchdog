@@ -17,8 +17,19 @@
 # NetworkManager to reconnect; then /usr/local/sbin/wifi-recover -y
 # (PCI remove/rescan, ARPT root-port D3cold cycle). Never runs the ladder
 # when Wi-Fi is soft-blocked (user switched it off).
+#
+# 2026-11-09 20:47 lesson: never judge while recovery is still in flight.
+# A watchdog timer left over from the resume BEFORE a re-suspend fired
+# 0 s into the next thaw (the --on-active deadline had been pending across
+# the sleep), saw no interface (card still PCI-removed by the pre hook),
+# and wifi-recover then power-cycled the root port on a chip the rescan
+# had rescued seconds earlier - wedging its firmware until a reboot. The
+# sleep hook now cancels stale timers at suspend entry and reschedules
+# idempotently; this script additionally waits out the post-hook recovery
+# before judging (defense in depth for chained suspends and manual runs).
 set -u
 TAG=macbook-sleep
+STATE=/run/macbook-sleep
 RECOVER=/usr/local/sbin/wifi-recover
 
 ifaces() { iw dev 2>/dev/null | awk '$1=="Interface"{print $2}'; }
@@ -40,6 +51,33 @@ force_ps_off() {
   done
 }
 
+if wifi_soft_blocked; then
+  log "Wi-Fi soft-blocked (switched off) - leaving it alone"
+  exit 0
+fi
+
+# Do not judge while the post-suspend hook is still recovering the card:
+# $STATE/wifi exists from suspend entry until the post rescan has rebound
+# the card (a few seconds after thaw). Until then there is no interface to
+# judge - the card is PCI-removed on purpose.
+if [[ -f $STATE/wifi ]]; then
+  for _ in $(seq 1 30); do
+    [[ -f $STATE/wifi ]] || break
+    sleep 1
+  done
+  [[ -f $STATE/wifi ]] && log "post-hook recovery still in flight after 30 s"
+fi
+
+# A card that is merely slow to (re)bind is not a wedge: wait for an
+# interface to appear before declaring one missing.
+if [[ -z $(ifaces) ]]; then
+  for _ in $(seq 1 20); do
+    [[ -n $(ifaces) ]] && break
+    sleep 1
+  done
+fi
+
+# rfkill state may have changed while waiting above
 if wifi_soft_blocked; then
   log "Wi-Fi soft-blocked (switched off) - leaving it alone"
   exit 0
